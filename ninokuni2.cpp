@@ -22,10 +22,13 @@
 
 
 #include <SpecialK/log.h>
+#include <SpecialK/hooks.h>
 #include <SpecialK/config.h>
 #include <SpecialK/utility.h>
 #include <SpecialK/parameter.h>
 #include <SpecialK/plugin/plugin_mgr.h>
+
+#include <SpecialK/render/dxgi/dxgi_backend.h>
 
 #include <imgui/imgui.h>
 
@@ -138,12 +141,13 @@ struct
 
 
 
-sk::ParameterFloat* SK_NNK2_VirtualFPS = nullptr;
+sk::ParameterFloat* SK_NNK2_VirtualFPS    = nullptr;
+sk::ParameterBool*  SK_NNK2_ReduceShimmer = nullptr;
 
 static float SK_NNK2_target_fps = 0.0f;
 
 
-#define NNS_VERSION_NUM L"0.0.2"
+#define NNS_VERSION_NUM L"0.1.0"
 #define NNS_VERSION_STR L"NiNoStutter v " NNS_VERSION_NUM
 
 
@@ -163,10 +167,76 @@ SK_NNK2_CheckVersion (LPVOID user)
 
 
   if (SK_FetchVersionInfo (L"NiNoStutter"))
-    SK_UpdateSoftware (L"NiNoStutter");
+      SK_UpdateSoftware   (L"NiNoStutter");
 
   return 0;
 }
+
+
+bool SK_NNK2_CacheModes        = true;
+bool SK_NNK2_FixTextureShimmer = false;
+
+
+extern HRESULT
+WINAPI
+D3D11Dev_CreateSamplerState_Override
+(
+  _In_            ID3D11Device        *This,
+  _In_      const D3D11_SAMPLER_DESC  *pSamplerDesc,
+  _Out_opt_       ID3D11SamplerState **ppSamplerState );
+
+static D3D11Dev_CreateSamplerState_pfn _D3D11Dev_CreateSamplerState_Original = nullptr;
+
+HRESULT
+WINAPI
+SK_NNK2_CreateSamplerState
+(
+  _In_            ID3D11Device        *This,
+  _In_      const D3D11_SAMPLER_DESC  *pSamplerDesc,
+  _Out_opt_       ID3D11SamplerState **ppSamplerState )
+{
+  D3D11_SAMPLER_DESC new_desc = *pSamplerDesc;
+
+  // Fix sharpened textures
+  if (SK_NNK2_FixTextureShimmer && new_desc.MaxAnisotropy != 1)
+  {
+    if (new_desc.Filter == D3D11_FILTER_ANISOTROPIC)
+    {
+      new_desc.MaxAnisotropy = 16;
+      new_desc.MipLODBias    = std::fmax (0.0f, new_desc.MipLODBias);
+
+      HRESULT hr =
+        _D3D11Dev_CreateSamplerState_Original (This, &new_desc, ppSamplerState);
+
+      if (SUCCEEDED (hr))
+        return hr;
+    }
+
+    else
+    {
+      new_desc.MaxAnisotropy = 1;
+
+      HRESULT hr =
+        _D3D11Dev_CreateSamplerState_Original (This, &new_desc, ppSamplerState);
+
+      if (SUCCEEDED (hr))
+        return hr;
+    }
+  }
+
+  return _D3D11Dev_CreateSamplerState_Original (This, pSamplerDesc, ppSamplerState);
+}
+
+typedef BOOL (WINAPI *IsIconic_pfn)(void);
+IsIconic_pfn IsIconic_Original = nullptr;
+
+BOOL
+WINAPI
+IsIconic_Detour (void)
+{
+  return FALSE;
+}
+
 
 
 void
@@ -188,21 +258,60 @@ SK_NNK2_InitPlugin (void)
   SK_NNK2_VirtualFPS->load (SK_NNK2_target_fps);
 
 
-  if (SK_NNK2_target_fps != 0.0f)
+  SK_NNK2_ReduceShimmer =
+    dynamic_cast <sk::ParameterBool *> (
+      g_ParameterFactory.create_parameter <bool> (L"Eliminate negative LOD biases")
+    );
+
+  SK_NNK2_ReduceShimmer->register_to_ini (
+    dll_ini, L"NiNoStutter.Textures", L"ReduceShimmer"
+  );
+
+  SK_NNK2_ReduceShimmer->load (SK_NNK2_FixTextureShimmer);
+
+
+  CreateThread (nullptr, 0x0, [](LPVOID user) -> DWORD
   {
-    config.window.background_render = true;
+    // Fix for window-management issues in windowed mode
+    while (SK_GetFramesDrawn () < 8)
+    {
+      SleepEx (16UL, TRUE);
+    }
 
-    instn__write_dt_input.disable  ();
-    instn__write_dt_render.disable ();
-    instn__limit_branch.disable    ();
+    if (SK_NNK2_target_fps != 0.0f)
+    {
+      config.window.background_render = true;
 
-    static float* pfdTr = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA454);
-    static float* pfdTi = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA450);
+      instn__write_dt_input.disable  ();
+      instn__write_dt_render.disable ();
+      instn__limit_branch.disable    ();
 
-    *pfdTr = ( 1.0f / SK_NNK2_target_fps );
-    *pfdTi = ( 1.0f / SK_NNK2_target_fps );
-  }
+      static float* pfdTr = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA454);
+      static float* pfdTi = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA450);
+
+      *pfdTr = ( 1.0f / SK_NNK2_target_fps );
+      *pfdTi = ( 1.0f / SK_NNK2_target_fps );
+    }
+
+    SK_Thread_CloseSelf ();
+
+    return 0;
+  }, nullptr, 0x00, nullptr);
+
+
+    SK_CreateFuncHook (       L"ID3D11Device::CreateSamplerState",
+                               D3D11Dev_CreateSamplerState_Override,
+                                 SK_NNK2_CreateSamplerState,
+     static_cast_p2p <void> (&_D3D11Dev_CreateSamplerState_Original) );
+  MH_QueueEnableHook (         D3D11Dev_CreateSamplerState_Override  );
+
+  SK_CreateDLLHook2 (       L"user32.dll",
+                             "IsIconic",
+                              IsIconic_Detour,
+     static_cast_p2p <void> (&IsIconic_Original) );
 }
+
+
 
 bool
 SK_NNK2_PlugInCfg (void)
@@ -210,9 +319,11 @@ SK_NNK2_PlugInCfg (void)
   static float* pfdTr = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA454);
   static float* pfdTi = (float *)((uint8_t *)GetModuleHandle (nullptr) + 0x11DA450);
 
-  if (ImGui::CollapsingHeader (u8"Ni no Kuni™ II Revenant Kingdom", ImGuiTreeNodeFlags_DefaultOpen))
+  if (ImGui::CollapsingHeader (u8"Ni no Kuniâ„¢ II Revenant Kingdom", ImGuiTreeNodeFlags_DefaultOpen))
   {
     ImGui::TreePush ("");
+
+  //ImGui::Checkbox ("Cache IDXGIDisplay::GetDisplayModeList (...)", &SK_NNK2_CacheModes);
 
     static bool fixed_timestep = SK_NNK2_target_fps != 0.0f;
 
@@ -269,6 +380,11 @@ SK_NNK2_PlugInCfg (void)
     ImGui::Checkbox ("Prevent Controller Disconnect Messages",        &config.input.gamepad.xinput.placehold [0]);
     ImGui::SameLine ();
     ImGui::Checkbox ("Continue Rendering if Game Window is Inactive", &config.window.background_render);
+
+    if (ImGui::Checkbox ("Reduce Texture Shimmering", &SK_NNK2_FixTextureShimmer))
+    {
+      SK_NNK2_ReduceShimmer->store (SK_NNK2_FixTextureShimmer);
+    }
 
     ImGui::TreePop  ();
 
